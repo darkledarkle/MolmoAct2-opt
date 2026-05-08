@@ -80,6 +80,30 @@ cd lerobot
 
 For LIBERO replication and other evaluation instructions, follow the local LeRobot README at `lerobot/README.md` after the submodule is initialized.
 
+## Real-world Deployment
+
+MolmoAct2 supports out-of-the-box deployment on three robot embodiments:
+
+- **SO-100**
+- **Bimanual YAMs**
+- **Franka DROID setup**
+
+### SO-100 Setup
+
+For the best performance, we recommend using an **SO-100 with the standard wrist configuration** and a **third-person camera**.
+
+### Bimanual YAM Setup
+
+For the best performance, please build your Bimanual YAM setup following the reference design below:
+
+![Bimanual YAM setup](assets/m.png)
+
+All required components can be purchased using this [Bimanual YAM parts list](https://docs.google.com/spreadsheets/d/10bg4XJoeIqnuOBLpUlkhJV6QEYn_oK5IZVm5C7_kdbo/edit?usp=sharing).
+
+### Franka Setup
+
+For the Franka setup, we recommend following the official [DROID implementation](https://github.com/droid-dataset/droid) for best results.
+
 ## Coming Soon
 
 Full code for training, fine-tuning, deployment, evaluation, and more details are coming soon.
