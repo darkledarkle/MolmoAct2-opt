@@ -29,6 +29,11 @@ import torch
 from huggingface_hub import snapshot_download
 from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
+import cv2
+import base64
+
+import socket
+from urllib3.connection import HTTPConnection
 
 from gello_min.logging_utils import get_molmoact_logger
 
@@ -72,36 +77,50 @@ def _normalize_server_url(server: Optional[str]) -> str:
         s = s + "/act"
     return s
 
+def b64_jpeg(rgb: np.ndarray, quality: int = 95) -> str:
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
+    if not ok:
+        raise RuntimeError("jpeg encode failed")
+    return base64.b64encode(buf.tobytes()).decode()
 
 class MolmoAct(PolicyBase):
     def __init__(self, server: Optional[str] = None):
-        self.logger = get_molmoact_logger()
+        # self.logger = get_molmoact_logger()
         self.url = _normalize_server_url(server)
         self.multi_views = True
         self.action_horizon = 25
+        HTTPConnection.default_socket_options += [
+            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+            (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10),
+            (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5),
+            (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),
+        ]
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
 
         # Log configuration
-        self.logger.info(f"MolmoAct initialized with URL: {self.url}")
-        self.logger.info(f"Multi-views enabled: {self.multi_views}")
-        self.logger.info(f"Action horizon: {self.action_horizon}")
+        # self.logger.info(f"MolmoAct initialized with URL: {self.url}")
+        # self.logger.info(f"Multi-views enabled: {self.multi_views}")
+        # self.logger.info(f"Action horizon: {self.action_horizon}")
 
     def get_action_horizon(self):
         return self.action_horizon
 
     def prepare_input(self, obs, instruction):
-        self.logger.info("Preparing input for MolmoAct inference")
-        self.logger.info(f"Instruction: '{instruction}'")
+        # self.logger.info("Preparing input for MolmoAct inference")
+        # self.logger.info(f"Instruction: '{instruction}'")
         # self.logger.info(f"Camera keys - {obs['left_camera_rgb']}, {obs['front_camera_rgb']}, {obs['right_camera_rgb']}")
-        self.logger.info(f"State: {obs['joint_positions']}")
+        # self.logger.info(f"State: {obs['joint_positions']}")
 
         try:
             # Log image information
-            if hasattr(obs['left_camera_rgb'], 'shape'):
-                self.logger.info(f"Left image shape: {obs['left_camera_rgb'].shape}")
-            if hasattr(obs['front_camera_rgb'], 'shape'):
-                self.logger.info(f"Front image shape: {obs['front_camera_rgb'].shape}")
-            if hasattr(obs['right_camera_rgb'], 'shape'):
-                self.logger.info(f"Right image shape: {obs['right_camera_rgb'].shape}")
+            # if hasattr(obs['left_camera_rgb'], 'shape'):
+            #     self.logger.info(f"Left image shape: {obs['left_camera_rgb'].shape}")
+            # if hasattr(obs['front_camera_rgb'], 'shape'):
+            #     self.logger.info(f"Front image shape: {obs['front_camera_rgb'].shape}")
+            # if hasattr(obs['right_camera_rgb'], 'shape'):
+            #     self.logger.info(f"Right image shape: {obs['right_camera_rgb'].shape}")
 
             input_dict = {
                 "left_camera_rgb": obs["left_camera_rgb"],
@@ -111,14 +130,14 @@ class MolmoAct(PolicyBase):
                 "state": obs["joint_positions"]
             }
 
-            self.logger.info("Input preparation completed successfully")
+            # self.logger.info("Input preparation completed successfully")
             return input_dict
 
         except KeyError as e:
-            self.logger.error(f"Missing camera key in observation: {e}")
+            # self.logger.error(f"Missing camera key in observation: {e}")
             raise
         except Exception as e:
-            self.logger.error(f"Error preparing input: {e}")
+            # self.logger.error(f"Error preparing input: {e}")
             raise
 
     def inference(self, input_dict):
@@ -129,16 +148,16 @@ class MolmoAct(PolicyBase):
             lang = input_dict["instruction"]
             state = input_dict["state"]
 
-            self.logger.info(f"Processing instruction: '{lang}'")
-            self.logger.info(f"Number of images: {len(images)}")
-            self.logger.info(f"Number of joints: {len(state)}")
+            # self.logger.info(f"Processing instruction: '{lang}'")
+            # self.logger.info(f"Number of images: {len(images)}")
+            # self.logger.info(f"Number of joints: {len(state)}")
 
             start_time = time.time()
             response = self.send_request(images, lang, state, self.url)
             request_time = time.time() - start_time
 
-            self.logger.info(f"Server request completed in {request_time:.3f}s")
-            self.logger.info(f"Raw actions received: {len(response['actions'])} actions")
+            # self.logger.info(f"Server request completed in {request_time:.3f}s")
+            # self.logger.info(f"Raw actions received: {len(response['actions'])} actions")
 
             # processed_actions = self.prepare_output(actions)
             # self.logger.info(f"Processed {len(processed_actions)} actions")
@@ -146,7 +165,7 @@ class MolmoAct(PolicyBase):
             return response
 
         except Exception as e:
-            self.logger.error(f"Error during inference: {e}")
+            # self.logger.error(f"Error during inference: {e}")
             raise
 
     # def prepare_output(self, raw_actions):
@@ -171,19 +190,19 @@ class MolmoAct(PolicyBase):
     #         self.logger.error(f"Error preparing output: {e}")
     #         raise
 
+
     def send_request(self, images: List[np.ndarray], instruction: str, state: list, server_url: str):
         """
         Send the captured image and instruction to the inference server using json_numpy.
         Returns the action output as received from the server.
         """
         self.logger.info(f"Sending request to server: {server_url}")
-
         try:
             if not self.multi_views:
-                self.logger.info("Using single view mode")
+                # self.logger.info("Using single view mode")
                 # Convert PIL image to a NumPy array
                 image_np = np.array(images[0])
-                self.logger.info(f"Single image shape: {image_np.shape}")
+                # self.logger.info(f"Single image shape: {image_np.shape}")
 
                 # Prepare the payload with the image and instruction from the script
                 payload = {
@@ -192,47 +211,49 @@ class MolmoAct(PolicyBase):
                     "state" : state
                 }
             else:
-                self.logger.info("Using multi-view mode")
+                # self.logger.info("Using multi-view mode")
                 # Convert PIL image to a NumPy array
                 left_img_np = np.array(images[0])
                 front_img_np = np.array(images[1])
                 right_img_np = np.array(images[2])
 
-                self.logger.info(f"Left image shape: {left_img_np.shape}")
-                self.logger.info(f"Front image shape: {front_img_np.shape}")
-                self.logger.info(f"Right image shape: {right_img_np.shape}")
+                # self.logger.info(f"Left image shape: {left_img_np.shape}")
+                # self.logger.info(f"Front image shape: {front_img_np.shape}")
+                # self.logger.info(f"Right image shape: {right_img_np.shape}")
 
                 # Prepare the payload with the image and instruction from the script
                 payload = {
-                    "left_cam": left_img_np,
-                    "top_cam": front_img_np,
-                    "right_cam": right_img_np,
+                    "images": [
+                        b64_jpeg(front_img_np),
+                        b64_jpeg(left_img_np),
+                        b64_jpeg(right_img_np),
+                    ],
                     "timestamp": time.time(), # add timestamp for debugging
                     "instruction": instruction,
                     "state": state,
                     "normalization_tag": "yam_dual_molmoact2"
                 }
 
-            self.logger.info("Preparing HTTP request")
+            # self.logger.info("Preparing HTTP request")
             headers = {"Content-Type": "application/json"}
 
             # Serialize payload
             start_time = time.time()
             serialized_payload = json_numpy.dumps(payload)
             serialize_time = time.time() - start_time
-            self.logger.info(f"Payload serialized in {serialize_time:.3f}s")
+            # self.logger.info(f"Payload serialized in {serialize_time:.3f}s")
 
             # Send request
             start_time = time.time()
-            response = requests.post(server_url, headers=headers, data=serialized_payload)
+            response = self.session.post(server_url, headers=headers, data=serialized_payload)
             request_time = time.time() - start_time
 
-            self.logger.info(f"HTTP request completed in {request_time:.3f}s")
-            self.logger.info(f"Response status code: {response.status_code}")
+            # self.logger.info(f"HTTP request completed in {request_time:.3f}s")
+            # self.logger.info(f"Response status code: {response.status_code}")
 
             if response.status_code != 200:
                 error_msg = f"Server error: {response.text}"
-                self.logger.error(error_msg)
+                # self.logger.error(error_msg)
                 raise Exception(error_msg)
 
             # Parse response. Use json_numpy.loads explicitly so ndarrays
@@ -240,22 +261,22 @@ class MolmoAct(PolicyBase):
             start_time = time.time()
             response_data = json_numpy.loads(response.text)
             parse_time = time.time() - start_time
-            self.logger.info(f"Response parsed in {parse_time:.3f}s")
+            # self.logger.info(f"Response parsed in {parse_time:.3f}s")
 
-            self.logger.info("Server request completed successfully")
+            # self.logger.info("Server request completed successfully")
             return response_data
 
         except requests.exceptions.ConnectionError as e:
-            self.logger.error(f"Connection error to server {server_url}: {e}")
+            # self.logger.error(f"Connection error to server {server_url}: {e}")
             raise
         except requests.exceptions.Timeout as e:
-            self.logger.error(f"Request timeout to server {server_url}: {e}")
+            # self.logger.error(f"Request timeout to server {server_url}: {e}")
             raise
         except requests.exceptions.RequestException as e:
-            self.logger.error(f"Request error to server {server_url}: {e}")
+            # self.logger.error(f"Request error to server {server_url}: {e}")
             raise
         except Exception as e:
-            self.logger.error(f"Unexpected error during server request: {e}")
+            # self.logger.error(f"Unexpected error during server request: {e}")
             raise
 
 
@@ -343,7 +364,7 @@ class _LocalPolicy:
         repo_id: str,
         device: str,
         dtype: torch.dtype,
-        enable_cuda_graph: bool = False,
+        enable_cuda_graph: bool = True,
     ) -> None:
         self.default_cuda_graph = enable_cuda_graph
 
@@ -453,19 +474,19 @@ class MolmoActLocal(PolicyBase):
                 f"dtype must be one of {sorted(dtype_map)}, got {dtype!r}"
             )
 
-        self.logger.info(
-            f"MolmoActLocal: loading {repo_id} (device={device}, dtype={dtype})"
-        )
+        # self.logger.info(
+        #     f"MolmoActLocal: loading {repo_id} (device={device}, dtype={dtype})"
+        # )
         self.policy = _LocalPolicy(
             repo_id=repo_id,
             device=device,
             dtype=dtype_map[dtype],
             enable_cuda_graph=self.enable_cuda_graph,
         )
-        self.logger.info(
-            f"MolmoActLocal ready. action_horizon={self.action_horizon}, "
-            f"num_steps={self.num_steps}, enable_cuda_graph={self.enable_cuda_graph}"
-        )
+        # self.logger.info(
+        #     f"MolmoActLocal ready. action_horizon={self.action_horizon}, "
+        #     f"num_steps={self.num_steps}, enable_cuda_graph={self.enable_cuda_graph}"
+        # )
 
         if warmup:
             self._warmup()
@@ -485,17 +506,17 @@ class MolmoActLocal(PolicyBase):
                 enable_cuda_graph=self.enable_cuda_graph,
             )
         except Exception:
-            self.logger.exception("MolmoActLocal warmup failed (continuing)")
+            # self.logger.exception("MolmoActLocal warmup failed (continuing)")
             return
-        self.logger.info(f"MolmoActLocal warmup OK ({time.time() - t0:.1f}s)")
+        # self.logger.info(f"MolmoActLocal warmup OK ({time.time() - t0:.1f}s)")
 
     def get_action_horizon(self) -> int:
         return self.action_horizon
 
     def prepare_input(self, obs: dict, instruction: str) -> dict:
-        self.logger.info(
-            f"Preparing input for MolmoActLocal (instruction: '{instruction}')"
-        )
+        # self.logger.info(
+        #     f"Preparing input for MolmoActLocal (instruction: '{instruction}')"
+        # )
         try:
             return {
                 "left_camera_rgb": obs["left_camera_rgb"],
@@ -505,7 +526,7 @@ class MolmoActLocal(PolicyBase):
                 "state": obs["joint_positions"],
             }
         except KeyError as e:
-            self.logger.error(f"Missing key in observation: {e}")
+            # self.logger.error(f"Missing key in observation: {e}")
             raise
 
     def inference(self, input_dict: dict) -> dict:
@@ -519,8 +540,8 @@ class MolmoActLocal(PolicyBase):
             num_steps=self.num_steps,
             enable_cuda_graph=self.enable_cuda_graph,
         )
-        self.logger.info(
-            f"Local inference completed in {time.time() - t0:.3f}s "
-            f"({len(actions)} actions)"
-        )
+        # self.logger.info(
+        #     f"Local inference completed in {time.time() - t0:.3f}s "
+        #     f"({len(actions)} actions)"
+        # )
         return {"actions": actions}

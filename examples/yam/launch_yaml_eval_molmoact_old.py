@@ -8,9 +8,9 @@ dataset on the way out.
 
 CLI::
 
-    python examples/yam/launch_yaml_eval_molmoact.py \
-        --left_config_path examples/yam/configs/yam_left.yaml \
-        --right_config_path examples/yam/configs/yam_right.yaml \
+    python -m experiments.launch_yaml_eval_molmoact \
+        --left_config_path configs/yam_left.yaml \
+        --right_config_path configs/yam_right.yaml \
         -n 10
 """
 
@@ -26,14 +26,14 @@ from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional, Tuple
 
 import numpy as np
-# import torch
+import torch
 import tyro
 from omegaconf import OmegaConf
 
-from camera_client import CameraClient
-from gello_min.realsense_camera import RealSenseCamera, get_device_ids
-from gello_min.env import RobotEnv
-from eval_utils import (
+from gello.cameras.camera_client import CameraClient
+from gello.cameras.realsense_camera import RealSenseCamera, get_device_ids
+from gello.env import RobotEnv
+from gello.utils.eval_utils import (
     EvalRolloutSaver,
     LiveCameraView,
     RolloutOutcome,
@@ -42,19 +42,26 @@ from eval_utils import (
     prompt_instruction,
     resolve_label,
 )
-from gello_min.robot import BimanualRobot
-from gello_min.launch_utils import instantiate_from_dict, move_to_start_position
-from gello_min.logging_utils import log_collect_demos
-from molmoact_client import MolmoAct, MolmoActLocal
+from gello.robots.robot import BimanualRobot
+from gello.utils.launch_utils import instantiate_from_dict, move_to_start_position
+from gello.utils.logging_utils import log_collect_demos
+from molmoact import MolmoAct, MolmoActLocal
+
+from collections import defaultdict
+import concurrent.futures
+from collections import deque
 
 from action_lipo.lipo import ActionLiPo
-from concurrent.futures import ThreadPoolExecutor, Future
 
+from warmup import run_warmup
+
+from concurrent.futures import ThreadPoolExecutor, Future
+from typing import Optional
+import numpy as np
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-# DEVICE = os.environ.get("LEROBOT_TEST_DEVICE", "cuda") if torch.cuda.is_available() else "cpu"
-
+DEVICE = os.environ.get("LEROBOT_TEST_DEVICE", "cuda") if torch.cuda.is_available() else "cpu"
 
 # ---------------------------------------------------------------------------
 # atexit parking
@@ -65,7 +72,6 @@ _bimanual: bool = False
 _left_cfg: Optional[Dict[str, Any]] = None
 _right_cfg: Optional[Dict[str, Any]] = None
 _cleanup_done: bool = False
-
 
 def _park_robot() -> None:
     """atexit hook: park arm back at start_joints regardless of exit path."""
@@ -82,11 +88,9 @@ def _park_robot() -> None:
     except Exception as exc:  # noqa: BLE001 — best-effort cleanup
         logger.warning("Parking failed: %s", exc)
 
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
 
 @dataclass
 class Args:
@@ -186,119 +190,48 @@ def _build_env(
 # Inner loop
 # ---------------------------------------------------------------------------
 
-JOINT_DIMS = np.array([0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]) # skip gripper
-MAX_DELTA_RAD = 0.22
-MAX_DELTA_GRIPPER = 0.30
-MAX_START_INDEX = 12
-MIN_EXEC_STEPS = 15
-MAX_BOUNDARY_DELTA = 0.12
-QUERY_STEP = 16
+
+def dynamic_smoothing(env: RobotEnv, target_joints: np.ndarray) -> Dict[str, Any]:
+    """Apply ``target_joints`` via sub-tick linear interpolation. Returns final obs.
+
+    The interpolation sub-steps issue command-only ticks (no camera reads). A
+    single ``get_obs()`` at the end produces the obs the caller actually
+    consumes — this is what makes the rollout loop run at robot rate instead
+    of camera rate.
+    """
+    curr_joints = env.get_robot_state()["joint_positions"]
+    max_delta = float(np.abs(curr_joints - target_joints).max())
+    steps = min(int(max_delta / 0.01), 100)
+    if steps <= 1:
+        # print(f"execute at {steps}")
+        env.step_command_only(target_joints)
+    else:
+        for jnt in np.linspace(curr_joints, target_joints, steps):
+            # print(f"execute at {steps}")
+            env.step_command_only(jnt)
+            time.sleep(0.001)
+    return env.get_obs()
+
+
+# def capped_step(env, target, max_vel_rad_per_s=1.1):
+#     curr = env.get_robot_state()["joint_positions"]
+#     delta = target - curr
+#     max_delta = max_vel_rad_per_s * STEP_DT
+#     scale = min(1.0, max_delta / (np.abs(delta).max() + 1e-9))
+#     clipped_target = curr + scale * delta
+
+#     steps = max(1, int(np.abs(delta * scale).max() / 0.005))
+#     steps = min(steps, 10)  # cap sub-steps so we don't blow the timing budget
+#     for jnt in np.linspace(curr, clipped_target, steps):
+#         env.step_command_only(jnt)
+    
+#     return env.get_obs()
+
+QUERY_STEP = 20
 EXECUTE_STEPS = 25
-NUM_STEPS = 5
-STEP_DT = 1 / 30
-RESIDUAL_BLEND_STEPS = 4
-CHUNK_SMOOTH_SIGMA = 1.5
-BLEND_STEPS = 8
-MAX_FRAME_AGE_MS = 500.0
-
-class MotionLimiter:
-    def __init__(
-        self,
-        *,
-        enabled: bool,
-        max_velocity: float,
-        max_acceleration: float,
-        max_jerk: float,
-        include_grippers: bool,
-    ) -> None:
-        self.enabled = enabled
-        self.max_velocity = max(float(max_velocity), 0.0)
-        self.max_acceleration = max(float(max_acceleration), 0.0)
-        self.max_jerk = max(float(max_jerk), 0.0)
-        self.include_grippers = include_grippers
-        self.last_action: np.ndarray | None = None
-        self.velocity = np.zeros(14, dtype=np.float32)
-        self.acceleration = np.zeros(14, dtype=np.float32)
-
-    def reset(self) -> None:
-        self.last_action = None
-        self.velocity.fill(0.0)
-        self.acceleration.fill(0.0)
-
-    def limit(self, target: np.ndarray, *, state14: np.ndarray) -> np.ndarray:
-        target = np.asarray(target, dtype=np.float32)
-        state = np.asarray(state14, dtype=np.float32)
-        if not self.enabled or target.shape != (14,) or state.shape != (14,):
-            return target
-
-        base = state if self.last_action is None else self.last_action
-        dims = np.arange(14) if self.include_grippers else JOINT_DIMS
-        desired_velocity = target - base
-        velocity = desired_velocity.copy()
-        acceleration = velocity - self.velocity
-
-        if self.max_jerk > 0.0:
-            acceleration[dims] = self.acceleration[dims] + np.clip(
-                acceleration[dims] - self.acceleration[dims],
-                -self.max_jerk,
-                self.max_jerk,
-            )
-        if self.max_acceleration > 0.0:
-            acceleration[dims] = np.clip(
-                acceleration[dims],
-                -self.max_acceleration,
-                self.max_acceleration,
-            )
-
-        velocity[dims] = self.velocity[dims] + acceleration[dims]
-        if self.max_velocity > 0.0:
-            velocity[dims] = np.clip(velocity[dims], -self.max_velocity, self.max_velocity)
-
-        out = target.copy()
-        out[dims] = base[dims] + velocity[dims]
-        self.acceleration = velocity - self.velocity
-        self.velocity = velocity
-        self.last_action = out.copy()
-        return out
-
-def _clamp_delta(
-    target: np.ndarray,
-    current: np.ndarray,
-    max_joint: float,
-    max_gripper: float,
-) -> tuple[np.ndarray, int]:
-    delta = target - current
-    limits = np.full_like(delta, max_joint)
-    limits[-1] = max_gripper
-    n = int(np.sum(np.abs(delta) > limits + 1e-9))
-    return current + np.clip(delta, -limits, limits), n
-
-def _chunk_switch_usable(
-    new_chunk: np.ndarray,
-    splice: int,
-    last_action: np.ndarray,
-) -> tuple[bool, str]:
-    if splice > MAX_START_INDEX:
-        return False, f"splice_high:{splice}"
-    boundary = float(np.max(np.abs(
-        new_chunk[splice][JOINT_DIMS] - last_action[JOINT_DIMS]
-    )))
-    if boundary > MAX_BOUNDARY_DELTA:
-        return False, f"boundary_high:{boundary:.3f}"
-    return True, "ok"
-
-def _smooth_chunk(actions: np.ndarray, sigma: float) -> np.ndarray:
-    if sigma <= 0.0 or actions.shape[0] < 3:
-        return actions
-    radius = min(int(3.0 * sigma) + 1, actions.shape[0] // 2)
-    x = np.arange(-radius, radius + 1, dtype=np.float64)
-    kernel = np.exp(-0.5 * (x / sigma) ** 2)
-    kernel /= kernel.sum()
-    out = actions.copy()
-    for d in JOINT_DIMS:
-        padded = np.pad(actions[:, d].astype(np.float64), radius, mode="edge")
-        out[:, d] = np.convolve(padded, kernel, mode="valid").astype(np.float32)
-    return out
+MEAN_INFERENCE_STEPS = 5
+NUM_STEPS = 4
+STEP_DT = 1/30
 
 def run_one_rollout(
     env: RobotEnv,
@@ -311,120 +244,65 @@ def run_one_rollout(
     live_view: LiveCameraView,
 ) -> RolloutOutcome:
 
-    def fetch_chunk(obs):
+    # runs in backround thread to call server and return actions
+    def fetch_chunk(obs, prior_actions=None):
         input_dict = policy.prepare_input(obs, instruction)
         input_dict["num_steps"] = NUM_STEPS
-        return np.asarray(policy.inference(input_dict)["actions"])
+        if prior_actions is not None:
+            input_dict["prior_actions"] = prior_actions
+        return policy.inference(input_dict)["actions"]
 
     executor = ThreadPoolExecutor(max_workers=1)
-    next_chunk: Optional[Future] = None
-    action_chunk: Optional[np.ndarray] = None
-    last_action: Optional[np.ndarray] = None
-    apply_step: Optional[int] = None
-    chunk_index = 0
 
-    motion_limiter = MotionLimiter(
-        enabled=True,
-        max_velocity=0.10,
-        max_acceleration=0.035,
-        max_jerk=0.020,
-        include_grippers=False,
+    next_chunk: Optional[Future] = None
+
+    lipo = ActionLiPo(
+    solver="OSQP",
+    chunk_size=30,
+    blending_horizon=7, # steps to blend at boundary ~200ms worth
+    action_dim=14,
+    len_time_delay=0,
+    dt=STEP_DT, # 30 hz
+    epsilon_blending=0.02,
+    epsilon_path=0.003,
     )
 
+    chunk_step = 0 # seperatly track position in current chunk
+    action_chunk = fetch_chunk(env.get_obs())
+    prior_actions = None
+    inference_start_step = None
+
     for step in range(max_steps):
-        t0 = time.perf_counter()
-
-        # fire inference
-        if next_chunk is None and chunk_index >= QUERY_STEP:
+        if next_chunk is None and chunk_step >= QUERY_STEP:
+            prior_actions = action_chunk[chunk_step:25]
+            inference_start_step = chunk_step
             obs_snapshot = env.get_obs()
-            next_chunk = executor.submit(fetch_chunk, obs_snapshot)
-            apply_step = chunk_index
+            next_chunk = executor.submit(fetch_chunk, obs_snapshot, prior_actions)
+        if next_chunk is not None and (next_chunk.done() or chunk_step >= EXECUTE_STEPS):
+            if not next_chunk.done():
+                print(f"[WARN] blocking at step {chunk_step}")
+            new_chunk = np.asarray(next_chunk.result())
 
-        # handle chunk arrival
-        if next_chunk is not None and next_chunk.done():
-            new_chunk = next_chunk.result()
-            splice = chunk_index - apply_step
+            solved, _ = lipo.solve(new_chunk, action_chunk, lipo.B)
+            action_chunk = solved if solved is not None else new_chunk
 
-            if action_chunk is None:
-                # always accept first chunk
-                action_chunk = new_chunk
-                chunk_index = 0
-                next_chunk = None
-            else:
-                usable, reason = _chunk_switch_usable(new_chunk, splice, last_action)
-                if usable:
-                    # lipo -> residual blend -> guassian smooth
-                    motion_limiter.reset()
+            chunk_step = max(chunk_step - inference_start_step, MEAN_INFERENCE_STEPS)
+            print(f"skipping to {chunk_step}")
+            next_chunk = None
 
-                    horizen = len(new_chunk) - splice
-                    blending_horizon = min(splice + blend_steps, horizen)
-
-                    lipo = ActionLiPo(
-                    solver="OSQP",
-                    chunk_size=30,
-                    blending_horizon=blending_horizon,
-                    action_dim=14,
-                    len_time_delay=splice,
-                    dt=STEP_DT, # 30 hz
-                    epsilon_blending=0.02,
-                    epsilon_path=0.003,
-                    )
-                
-                    solved, _ = lipo.solve(
-                        new_chunk.astype(np.float64),
-                        action_chunk.astype(np.float64),
-                        len_past_actions=splice + BLEND_STEPS,
-                    )
-
-                    blended = np.asarray(solved if solved is not None else new_chunk, dtype=np.float32)
-
-                    if last_action is not None:
-                        residual = last_action[JOINT_DIMS] - blended[splice, JOINT_DIMS]
-                        blend_steps = min(RESIDUAL_BLEND_STEPS, len(blended) - splice)
-                        for b in range(blend_steps):
-                            t = b / blend_steps
-                            weight = 1.0 - (t * t * (3.0 - 2.0 * t))  # smoothstep
-                            blended[splice + b, JOINT_DIMS] += weight * residual
-                    
-                    blended = _smooth_chunk(blended, sigma=CHUNK_SMOOTH_SIGMA)
-
-                    action_chunk = blended
-                    chunk_index = splice
-                    next_chunk = None
-
-                elif chunk_index >= 30:
-                    # exhausted, discard and re-request
-                    print(f"[discard] {reason}, re-requesting")
-                    next_chunk = None
-                    obs_snapshot = env.get_obs()
-                    next_chunk = executor.submit(fetch_chunk, obs_snapshot)
-                    apply_step = chunk_index
-                else:
-                    # defer
-                    print(f"[defer] {reason}")
-
-        # execute
-        if action_chunk is not None and chunk_index < len(action_chunk):
-            action = np.asarray(action_chunk[chunk_index])
-            action = motion_limiter.limit(action, state14=state14)
-            state14 = env.get_robot_state()["joint_positions"]
-            act_l, _ = _clamp_delta(action[:7], state14[:7], MAX_DELTA_RAD, MAX_DELTA_GRIPPER)
-            act_r, _ = _clamp_delta(action[7:], state14[7:], MAX_DELTA_RAD, MAX_DELTA_GRIPPER)
-            action14 = np.concatenate([act_l, act_r])
-            last_action = action14.copy()
-            env.step_command_only(action14)
-            chunk_index += 1
-
-        # rate limit
-        dt = time.perf_counter() - t0
-        if dt < STEP_DT:
-            time.sleep(STEP_DT - dt)
+        action = np.asarray(action_chunk[chunk_step])
+        dynamic_smoothing(env, action)
+        chunk_step += 1
 
     return RolloutOutcome(end_reason="timeout", last_step=max_steps)
+
+
+
 
 # ---------------------------------------------------------------------------
 # Session driver
 # ---------------------------------------------------------------------------
+
 
 def run_session(
     env: RobotEnv,
@@ -557,12 +435,37 @@ def _convert_if_any(
 # ---------------------------------------------------------------------------
 
 
+def _build_policy(left_cfg: Dict[str, Any]) -> MolmoAct:
+    """Construct the eval policy from the left config's ``eval`` block.
+
+    Built BEFORE the robot is energized (see ``main``): ``MolmoActLocal`` loads
+    a multi-GB snapshot onto the GPU and holds the GIL for seconds, which would
+    starve the CAN command thread and trip the 400ms motor watchdog if the
+    motors were already live.
+    """
+    eval_cfg = left_cfg.get("eval") or {}
+    mode = eval_cfg.get("mode", "server")
+    if mode == "local":
+        return MolmoActLocal(**(eval_cfg.get("local") or {}))
+    elif mode == "server":
+        return MolmoAct(server=eval_cfg.get("molmoact_server"))
+    raise SystemExit(f"eval.mode must be 'server' or 'local', got {mode!r}")
+
+
 def main() -> None:
     atexit.register(_park_robot)
 
     args = tyro.cli(Args)
     if args.num_rollouts < 1:
         raise SystemExit("--num_rollouts must be >= 1")
+
+    # Load the policy BEFORE building the robot. Energizing the motors starts a
+    # ~250Hz background CAN command thread; a heavy, GIL-holding model load done
+    # while the motors are live starves that thread, the 400ms watchdog fires,
+    # and the motors report "loss communication" (both buses drop at once). So
+    # do the expensive load here, then energize.
+    left_cfg_pre = OmegaConf.to_container(OmegaConf.load(args.left_config_path), resolve=True)
+    policy = _build_policy(left_cfg_pre)
 
     env, left_cfg, right_cfg, bimanual = _build_env(args)
 
@@ -584,14 +487,8 @@ def main() -> None:
         f"max_steps: {left_cfg.get('max_steps', 1000)}"
     )
 
-    eval_cfg = left_cfg.get("eval") or {}
-    mode = eval_cfg.get("mode", "server")
-    if mode == "local":
-        policy = MolmoActLocal(**(eval_cfg.get("local") or {}))
-    elif mode == "server":
-        policy = MolmoAct(server=eval_cfg.get("molmoact_server"))
-    else:
-        raise SystemExit(f"eval.mode must be 'server' or 'local', got {mode!r}")
+    run_warmup() # warm up camera server and policy
+
     run_session(
         env=env,
         policy=policy,

@@ -8,11 +8,11 @@
 sensors:
   cameras:
     left_camera:
-      device_id: "<left_camera_serial>"
+      device_id: "353322270857"
     front_camera:
-      device_id: "<front_camera_serial>"
+      device_id: "353322271629"
     right_camera:
-      device_id: "<right_camera_serial>"
+      device_id: "353322271234"
 
 # Left YAM arm. `channel` is the CAN interface name from `ip link show`.
 robot:
@@ -65,13 +65,13 @@ eval:
 
   # Used when mode == local. Needs transformers (+ huggingface_hub, PIL,
   # accelerate, safetensors). bf16 needs ~10-14 GB VRAM; fp32 ~26 GB.
-  local:
-    repo_id: "allenai/MolmoAct2-BimanualYAM"
-    device: "cuda:0"
-    dtype: "bfloat16"          # bfloat16 | float16 | float32
-    num_steps: 10              # flow-matching denoising steps
-    enable_cuda_graph: false
-    warmup: true               # eat the first-call latency at startup
+  # local:
+  #   repo_id: "allenai/MolmoAct2-BimanualYAM"
+  #   device: "cuda:0"
+  #   dtype: "bfloat16"          # bfloat16 | float16 | float32
+  #   num_steps: 10              # flow-matching denoising steps
+  #   enable_cuda_graph: false
+  #   warmup: true               # eat the first-call latency at startup
 
   # Long-lived ZMQ camera server. When enabled, the launcher pulls obs from the
   # server instead of opening RealSense devices in-process. Start it first:
