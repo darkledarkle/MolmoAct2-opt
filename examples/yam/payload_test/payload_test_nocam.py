@@ -5,7 +5,7 @@ import urllib3.connectionpool as cp
 from urllib3.connection import HTTPConnection
 json_numpy.patch()
 
-URL = "http://195.26.233.28:41285/act"
+URL = "http://195.26.233.28:50726/act"
 NUM_STEPS = 10
 JPEG_QUALITY = 95
 N = 50

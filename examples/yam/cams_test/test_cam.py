@@ -11,7 +11,7 @@ resp = pickle.loads(sock.recv())
 if resp['ok']:
     for name, frame in resp['frames'].items():
         bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        path = f'/home/jannik/molmoact2/examples/yam/cams_test/cams_testcam_{name}.jpg'
+        path = f'/home/pantheon/molmoact2/MolmoAct2-opt/examples/yam/cams_test/cams_testcam_{name}.jpg'
         cv2.imwrite(path, bgr)
         print(f'Saved {path} shape={frame.shape}')
 else:

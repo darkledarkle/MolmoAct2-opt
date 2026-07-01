@@ -8,21 +8,21 @@
 sensors:
   cameras:
     left_camera:
-      device_id: "353322270857"
+      device_id: "353322270649"
     front_camera:
-      device_id: "353322271629"
+      device_id: "353322270968"
     right_camera:
-      device_id: "353322271234"
+      device_id: "353322271538"
 
 # Left YAM arm. `channel` is the CAN interface name from `ip link show`.
 robot:
   _target_: gello_min.yam.YAMRobot
-  channel: can_left
+  channel: can_follower_l
 
 # Only `start_joints` is used by eval (the arm interpolates here between
 # rollouts). 7-D: 6 arm joints + 1 gripper.
 agent:
-  start_joints: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+  start_joints: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 hz: 30            # control loop rate
 max_steps: 1000   # per-rollout timeout in control steps
@@ -33,7 +33,7 @@ max_steps: 1000   # per-rollout timeout in control steps
 storage:
   base_dir: "./yam_eval_runs"
   task_directory: "session"
-  language_instruction: "pick up the object"
+  language_instruction: "pick up the colored objects and place in the box"
   saver_max_workers: 2
   png_compress_level: 1
 
@@ -61,7 +61,7 @@ eval:
   # Used when mode == server. Accepts a full URL, a bare host:port, or an
   # ngrok hostname; "/act" is appended automatically. Defaults to the local
   # server's default port if omitted.
-  molmoact_server: "127.0.0.1:8202"
+  molmoact_server: "195.26.233.28:50726"
 
   # Used when mode == local. Needs transformers (+ huggingface_hub, PIL,
   # accelerate, safetensors). bf16 needs ~10-14 GB VRAM; fp32 ~26 GB.

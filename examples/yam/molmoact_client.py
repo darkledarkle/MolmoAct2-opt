@@ -34,6 +34,7 @@ import base64
 
 import socket
 from urllib3.connection import HTTPConnection
+from requests.adapters import HTTPAdapter
 
 from gello_min.logging_utils import get_molmoact_logger
 
@@ -86,7 +87,7 @@ def b64_jpeg(rgb: np.ndarray, quality: int = 95) -> str:
 
 class MolmoAct(PolicyBase):
     def __init__(self, server: Optional[str] = None):
-        # self.logger = get_molmoact_logger()
+        self.logger = get_molmoact_logger()
         self.url = _normalize_server_url(server)
         self.multi_views = True
         self.action_horizon = 25
@@ -95,23 +96,25 @@ class MolmoAct(PolicyBase):
             (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10),
             (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5),
             (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),
+            (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
         ]
         self.session = requests.Session()
+        self.session.mount("http://", HTTPAdapter(pool_connections=1, pool_maxsize=1))
         self.session.headers.update({"Content-Type": "application/json"})
 
         # Log configuration
-        # self.logger.info(f"MolmoAct initialized with URL: {self.url}")
-        # self.logger.info(f"Multi-views enabled: {self.multi_views}")
-        # self.logger.info(f"Action horizon: {self.action_horizon}")
+        self.logger.info(f"MolmoAct initialized with URL: {self.url}")
+        self.logger.info(f"Multi-views enabled: {self.multi_views}")
+        self.logger.info(f"Action horizon: {self.action_horizon}")
 
     def get_action_horizon(self):
         return self.action_horizon
 
     def prepare_input(self, obs, instruction):
-        # self.logger.info("Preparing input for MolmoAct inference")
-        # self.logger.info(f"Instruction: '{instruction}'")
+        self.logger.info("Preparing input for MolmoAct inference")
+        self.logger.info(f"Instruction: '{instruction}'")
         # self.logger.info(f"Camera keys - {obs['left_camera_rgb']}, {obs['front_camera_rgb']}, {obs['right_camera_rgb']}")
-        # self.logger.info(f"State: {obs['joint_positions']}")
+        self.logger.info(f"State: {obs['joint_positions']}")
 
         try:
             # Log image information
@@ -130,18 +133,18 @@ class MolmoAct(PolicyBase):
                 "state": obs["joint_positions"]
             }
 
-            # self.logger.info("Input preparation completed successfully")
+            self.logger.info("Input preparation completed successfully")
             return input_dict
 
         except KeyError as e:
-            # self.logger.error(f"Missing camera key in observation: {e}")
+            self.logger.error(f"Missing camera key in observation: {e}")
             raise
         except Exception as e:
-            # self.logger.error(f"Error preparing input: {e}")
+            self.logger.error(f"Error preparing input: {e}")
             raise
 
     def inference(self, input_dict):
-        self.logger.info("Starting MolmoAct inference")
+        # self.logger.info("Starting MolmoAct inference")
 
         try:
             images = [input_dict["left_camera_rgb"], input_dict["front_camera_rgb"], input_dict["right_camera_rgb"]]
@@ -196,7 +199,7 @@ class MolmoAct(PolicyBase):
         Send the captured image and instruction to the inference server using json_numpy.
         Returns the action output as received from the server.
         """
-        self.logger.info(f"Sending request to server: {server_url}")
+        # self.logger.info(f"Sending request to server: {server_url}")
         try:
             if not self.multi_views:
                 # self.logger.info("Using single view mode")
@@ -248,8 +251,8 @@ class MolmoAct(PolicyBase):
             response = self.session.post(server_url, headers=headers, data=serialized_payload)
             request_time = time.time() - start_time
 
-            # self.logger.info(f"HTTP request completed in {request_time:.3f}s")
-            # self.logger.info(f"Response status code: {response.status_code}")
+            self.logger.info(f"HTTP request completed in {request_time:.3f}s")
+            self.logger.info(f"Response status code: {response.status_code}")
 
             if response.status_code != 200:
                 error_msg = f"Server error: {response.text}"
@@ -261,22 +264,22 @@ class MolmoAct(PolicyBase):
             start_time = time.time()
             response_data = json_numpy.loads(response.text)
             parse_time = time.time() - start_time
-            # self.logger.info(f"Response parsed in {parse_time:.3f}s")
+            self.logger.info(f"Response parsed in {parse_time:.3f}s")
 
             # self.logger.info("Server request completed successfully")
             return response_data
 
         except requests.exceptions.ConnectionError as e:
-            # self.logger.error(f"Connection error to server {server_url}: {e}")
+            self.logger.error(f"Connection error to server {server_url}: {e}")
             raise
         except requests.exceptions.Timeout as e:
-            # self.logger.error(f"Request timeout to server {server_url}: {e}")
+            self.logger.error(f"Request timeout to server {server_url}: {e}")
             raise
         except requests.exceptions.RequestException as e:
-            # self.logger.error(f"Request error to server {server_url}: {e}")
+            self.logger.error(f"Request error to server {server_url}: {e}")
             raise
         except Exception as e:
-            # self.logger.error(f"Unexpected error during server request: {e}")
+            self.logger.error(f"Unexpected error during server request: {e}")
             raise
 
 

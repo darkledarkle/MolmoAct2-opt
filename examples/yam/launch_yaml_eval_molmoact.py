@@ -192,9 +192,9 @@ MAX_DELTA_GRIPPER = 0.30
 MAX_START_INDEX = 12
 MIN_EXEC_STEPS = 15
 MAX_BOUNDARY_DELTA = 0.12
-QUERY_STEP = 16
+QUERY_STEP = 15
 EXECUTE_STEPS = 25
-NUM_STEPS = 5
+NUM_STEPS = 8
 STEP_DT = 1 / 30
 RESIDUAL_BLEND_STEPS = 4
 CHUNK_SMOOTH_SIGMA = 1.5
@@ -208,13 +208,11 @@ class MotionLimiter:
         enabled: bool,
         max_velocity: float,
         max_acceleration: float,
-        max_jerk: float,
         include_grippers: bool,
     ) -> None:
         self.enabled = enabled
         self.max_velocity = max(float(max_velocity), 0.0)
         self.max_acceleration = max(float(max_acceleration), 0.0)
-        self.max_jerk = max(float(max_jerk), 0.0)
         self.include_grippers = include_grippers
         self.last_action: np.ndarray | None = None
         self.velocity = np.zeros(14, dtype=np.float32)
@@ -237,12 +235,6 @@ class MotionLimiter:
         velocity = desired_velocity.copy()
         acceleration = velocity - self.velocity
 
-        if self.max_jerk > 0.0:
-            acceleration[dims] = self.acceleration[dims] + np.clip(
-                acceleration[dims] - self.acceleration[dims],
-                -self.max_jerk,
-                self.max_jerk,
-            )
         if self.max_acceleration > 0.0:
             acceleration[dims] = np.clip(
                 acceleration[dims],
@@ -278,6 +270,9 @@ def _chunk_switch_usable(
     splice: int,
     last_action: np.ndarray,
 ) -> tuple[bool, str]:
+    remaining = len(new_chunk) - splice
+    if remaining < MIN_EXEC_STEPS:
+        return False, f"too_short:{remaining}"
     if splice > MAX_START_INDEX:
         return False, f"splice_high:{splice}"
     boundary = float(np.max(np.abs(
@@ -303,8 +298,8 @@ def _smooth_chunk(actions: np.ndarray, sigma: float) -> np.ndarray:
 def run_one_rollout(
     env: RobotEnv,
     policy: MolmoAct,
-    saver: EvalRolloutSaver,
     instruction: str,
+    saver: EvalRolloutSaver,
     rollout_idx: int,
     num_rollouts: int,
     max_steps: int,
@@ -316,6 +311,8 @@ def run_one_rollout(
         input_dict["num_steps"] = NUM_STEPS
         return np.asarray(policy.inference(input_dict)["actions"])
 
+    print("initing vars")
+
     executor = ThreadPoolExecutor(max_workers=1)
     next_chunk: Optional[Future] = None
     action_chunk: Optional[np.ndarray] = None
@@ -323,19 +320,21 @@ def run_one_rollout(
     apply_step: Optional[int] = None
     chunk_index = 0
 
+    print("initing motion limiter")
+
     motion_limiter = MotionLimiter(
         enabled=True,
         max_velocity=0.10,
         max_acceleration=0.035,
-        max_jerk=0.020,
         include_grippers=False,
     )
 
+    print("starting loop")
     for step in range(max_steps):
         t0 = time.perf_counter()
 
         # fire inference
-        if next_chunk is None and chunk_index >= QUERY_STEP:
+        if next_chunk is None and (action_chunk is None or chunk_index >= QUERY_STEP):
             obs_snapshot = env.get_obs()
             next_chunk = executor.submit(fetch_chunk, obs_snapshot)
             apply_step = chunk_index
@@ -356,8 +355,8 @@ def run_one_rollout(
                     # lipo -> residual blend -> guassian smooth
                     motion_limiter.reset()
 
-                    horizen = len(new_chunk) - splice
-                    blending_horizon = min(splice + blend_steps, horizen)
+                    horizon = len(new_chunk) - splice
+                    blending_horizon = min(splice + BLEND_STEPS, horizon)
 
                     lipo = ActionLiPo(
                     solver="OSQP",
@@ -378,13 +377,13 @@ def run_one_rollout(
 
                     blended = np.asarray(solved if solved is not None else new_chunk, dtype=np.float32)
 
-                    if last_action is not None:
-                        residual = last_action[JOINT_DIMS] - blended[splice, JOINT_DIMS]
-                        blend_steps = min(RESIDUAL_BLEND_STEPS, len(blended) - splice)
-                        for b in range(blend_steps):
-                            t = b / blend_steps
-                            weight = 1.0 - (t * t * (3.0 - 2.0 * t))  # smoothstep
-                            blended[splice + b, JOINT_DIMS] += weight * residual
+                    # if last_action is not None:
+                    #     residual = last_action[JOINT_DIMS] - blended[splice, JOINT_DIMS]
+                    #     blend_steps = min(RESIDUAL_BLEND_STEPS, len(blended) - splice)
+                    #     for b in range(blend_steps):
+                    #         t = b / blend_steps
+                    #         weight = 1.0 - (t * t * (3.0 - 2.0 * t))  # smoothstep
+                    #         blended[splice + b, JOINT_DIMS] += weight * residual
                     
                     blended = _smooth_chunk(blended, sigma=CHUNK_SMOOTH_SIGMA)
 
@@ -404,22 +403,25 @@ def run_one_rollout(
                     print(f"[defer] {reason}")
 
         # execute
+        # print(chunk_index)
         if action_chunk is not None and chunk_index < len(action_chunk):
             action = np.asarray(action_chunk[chunk_index])
-            action = motion_limiter.limit(action, state14=state14)
             state14 = env.get_robot_state()["joint_positions"]
+            action = motion_limiter.limit(action, state14=state14)
             act_l, _ = _clamp_delta(action[:7], state14[:7], MAX_DELTA_RAD, MAX_DELTA_GRIPPER)
             act_r, _ = _clamp_delta(action[7:], state14[7:], MAX_DELTA_RAD, MAX_DELTA_GRIPPER)
             action14 = np.concatenate([act_l, act_r])
             last_action = action14.copy()
-            env.step_command_only(action14)
+            print(f"Sending action at index {chunk_index}")
+            # print(action14)
+            # env.step_command_only(action14)
             chunk_index += 1
 
         # rate limit
         dt = time.perf_counter() - t0
         if dt < STEP_DT:
             time.sleep(STEP_DT - dt)
-
+        
     return RolloutOutcome(end_reason="timeout", last_step=max_steps)
 
 # ---------------------------------------------------------------------------
@@ -440,6 +442,8 @@ def run_session(
     (as incomplete, with ``err.md``) and any rollouts already labeled in this
     session are still converted.
     """
+    print("started session")
+
     storage = left_cfg["storage"]
     base_save_dir = Path(storage["base_dir"]) / "data" / storage["task_directory"]
     max_steps = int(left_cfg.get("max_steps", 1000))
@@ -592,6 +596,8 @@ def main() -> None:
         policy = MolmoAct(server=eval_cfg.get("molmoact_server"))
     else:
         raise SystemExit(f"eval.mode must be 'server' or 'local', got {mode!r}")
+    
+    print("run session")
     run_session(
         env=env,
         policy=policy,

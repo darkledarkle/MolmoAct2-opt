@@ -5,9 +5,9 @@ import urllib3.connectionpool as cp
 from urllib3.connection import HTTPConnection
 json_numpy.patch()
 
-URL = "http://195.26.233.28:41285/act"
+URL = "http://195.26.233.28:50726/act"
 NUM_STEPS = 10
-JPEG_QUALITY = 20
+JPEG_QUALITY = 95
 N = 50
 
 # TCP_NODELAY + keepalive
@@ -39,7 +39,6 @@ sock = ctx.socket(zmq.REQ)
 sock.setsockopt(zmq.RCVTIMEO, 500)
 sock.connect("tcp://127.0.0.1:5555")
 
-FRAME_SHAPE = (360, 640, 3)
 def get_frames():
     sock.send(pickle.dumps({"cmd": "obs"}))
     resp = pickle.loads(sock.recv())
@@ -47,10 +46,6 @@ def get_frames():
         raise RuntimeError(f"Camera error: {resp.get('error')}")
     f = resp["frames"]
     return f["left_camera"], f["front_camera"], f["right_camera"]
-
-def enc(img):
-    _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-    return buf.tobytes()
 
 def b64_jpeg(rgb: np.ndarray, quality: int = 95) -> str:
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)

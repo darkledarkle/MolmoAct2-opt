@@ -5,7 +5,7 @@
 # Right YAM arm. `channel` is the CAN interface name from `ip link show`.
 robot:
   _target_: gello_min.yam.YAMRobot
-  channel: can_right
+  channel: can_follower_r
 
 agent:
   start_joints: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
